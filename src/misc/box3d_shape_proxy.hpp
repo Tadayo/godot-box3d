@@ -17,7 +17,14 @@ class Box3DShapeImpl3D;
 // should fall back to a different strategy (e.g. AABB overlap) for those shape types.
 class Box3DShapeProxy3D {
 public:
-	Box3DShapeProxy3D(const Box3DShapeImpl3D* p_shape, const Transform3D& p_transform);
+	// p_shrink pulls every surface inward by that many metres (sphere/capsule radius,
+	// box/cylinder extents). A shape cast that starts exactly in contact -- which is every
+	// tick for a body resting on the ground, and Box3D lets resting bodies settle a linear
+	// slop *inside* the surface -- reports fraction 0 with a zero normal, which is useless
+	// to a caller that needs to know what it is standing on. Shrinking the query shape past
+	// the slop turns that degenerate start into an ordinary touch with a real normal.
+	// Convex hulls are not shrunk: there is no cheap correct inset for an arbitrary hull.
+	Box3DShapeProxy3D(const Box3DShapeImpl3D* p_shape, const Transform3D& p_transform, float p_shrink = 0.0f);
 
 	bool is_supported() const { return supported; }
 

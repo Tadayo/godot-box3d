@@ -11,10 +11,22 @@
 
 #include <box3d/collision.h>
 
-Box3DShapeProxy3D::Box3DShapeProxy3D(const Box3DShapeImpl3D* p_shape, const Transform3D& p_transform) {
+namespace {
+
+// Never shrink a dimension away entirely -- a zero-radius sphere or a zero-extent box has
+// no surface for GJK to find, so an over-large margin would turn a hit into a miss.
+float shrink_extent(float p_extent, float p_shrink) {
+	return MAX(p_extent - p_shrink, p_extent * 0.25f);
+}
+
+} // namespace
+
+Box3DShapeProxy3D::Box3DShapeProxy3D(const Box3DShapeImpl3D* p_shape, const Transform3D& p_transform, float p_shrink) {
 	if (p_shape == nullptr) {
 		return;
 	}
+
+	p_shrink = MAX(p_shrink, 0.0f);
 
 	switch (p_shape->get_type()) {
 		case PhysicsServer3D::SHAPE_SPHERE: {
@@ -23,15 +35,17 @@ Box3DShapeProxy3D::Box3DShapeProxy3D(const Box3DShapeImpl3D* p_shape, const Tran
 			points[0] = godot_to_b3(p_transform.origin);
 			proxy.points = points.ptr();
 			proxy.count = 1;
-			proxy.radius = (float)sphere->get_radius();
+			proxy.radius = shrink_extent((float)sphere->get_radius(), p_shrink);
 			supported = true;
 			break;
 		}
 
 		case PhysicsServer3D::SHAPE_CAPSULE: {
 			const auto* capsule = static_cast<const Box3DCapsuleShapeImpl3D*>(p_shape);
-			const float radius = (float)capsule->get_radius();
-			const float half_seg = MAX(0.0f, (float)capsule->get_height() * 0.5f - radius);
+			const float radius = shrink_extent((float)capsule->get_radius(), p_shrink);
+			// The segment is derived from the UNSHRUNK radius so the capsule's end caps move
+			// inward with the shrink instead of the segment growing to compensate.
+			const float half_seg = MAX(0.0f, (float)capsule->get_height() * 0.5f - (float)capsule->get_radius());
 			points.resize(2);
 			points[0] = godot_to_b3(p_transform.xform(Vector3(0, half_seg, 0)));
 			points[1] = godot_to_b3(p_transform.xform(Vector3(0, -half_seg, 0)));
@@ -44,7 +58,11 @@ Box3DShapeProxy3D::Box3DShapeProxy3D(const Box3DShapeImpl3D* p_shape, const Tran
 
 		case PhysicsServer3D::SHAPE_BOX: {
 			const auto* box = static_cast<const Box3DBoxShapeImpl3D*>(p_shape);
-			const Vector3 half = box->get_half_extents();
+			const Vector3 raw_half = box->get_half_extents();
+			const Vector3 half(
+					shrink_extent((float)raw_half.x, p_shrink),
+					shrink_extent((float)raw_half.y, p_shrink),
+					shrink_extent((float)raw_half.z, p_shrink));
 			points.resize(8);
 			int i = 0;
 			for (int sx = -1; sx <= 1; sx += 2) {
@@ -64,8 +82,8 @@ Box3DShapeProxy3D::Box3DShapeProxy3D(const Box3DShapeImpl3D* p_shape, const Tran
 
 		case PhysicsServer3D::SHAPE_CYLINDER: {
 			const auto* cylinder = static_cast<const Box3DCylinderShapeImpl3D*>(p_shape);
-			const real_t radius = cylinder->get_radius();
-			const real_t half_height = cylinder->get_height() * 0.5;
+			const real_t radius = shrink_extent((float)cylinder->get_radius(), p_shrink);
+			const real_t half_height = shrink_extent((float)cylinder->get_height() * 0.5f, p_shrink);
 			// Match the tessellation b3CreateCylinder() uses for the simulated hull.
 			const int sides = Box3DCylinderShapeImpl3D::HULL_SIDES;
 			points.resize(2 * sides);

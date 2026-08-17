@@ -11,6 +11,7 @@
 #include "box3d_space_3d.hpp"
 
 #include <box3d/box3d.h>
+#include <box3d/constants.h> // B3_LINEAR_SLOP
 
 namespace {
 
@@ -138,6 +139,56 @@ float cast_result_fcn(b3ShapeId p_shape_id, b3Pos p_point, b3Vec3 p_normal, floa
 	ctx->normal = p_normal;
 	ctx->fraction = p_fraction;
 	return p_fraction;
+}
+
+// Recovers the surface normal for a contact the shape cast could not describe. A cast that
+// starts already touching reports the reverse of its own direction, so the floor a body is
+// standing on looks like a head-on wall no matter which way the body tries to move. GJK
+// between the two CORE shapes -- radii excluded, so a resting capsule's inner segment still
+// stands clear of the floor it is sunk into -- recovers the direction that separates them.
+// Returns false when the cores overlap too (deep penetration), where GJK has nothing to say.
+bool witness_normal(
+		const Box3DShapeImpl3D* p_shape,
+		const Transform3D& p_transform,
+		b3ShapeId p_other_shape_id,
+		Vector3& r_normal) {
+	const b3BodyId body_id = b3Shape_GetBody(p_other_shape_id);
+	auto* other = static_cast<Box3DShapedObjectImpl3D*>(b3Body_GetUserData(body_id));
+	if (other == nullptr) {
+		return false;
+	}
+
+	const Box3DShapeProxy3D self_proxy(p_shape, p_transform);
+	if (!self_proxy.is_supported()) {
+		return false;
+	}
+
+	const Transform3D other_transform = other->get_transform();
+	for (int32_t i = 0; i < other->get_shape_count(); i++) {
+		if (!other->has_shape_id(i) || !B3_ID_EQUALS(other->get_shape_id(i), p_other_shape_id)) {
+			continue;
+		}
+		const Box3DShapeProxy3D other_proxy(other->get_shape(i), other_transform * other->get_shape_transform(i));
+		if (!other_proxy.is_supported()) {
+			return false;
+		}
+
+		b3DistanceInput input{};
+		input.proxyA = self_proxy.get_proxy();
+		input.proxyB = other_proxy.get_proxy();
+		input.transform = b3Transform_identity;
+		input.useRadii = false;
+
+		b3SimplexCache cache{};
+		const b3DistanceOutput output = b3ShapeDistance(&input, &cache, nullptr, 0);
+		const Vector3 delta = b3_to_godot(output.pointA) - b3_to_godot(output.pointB);
+		if (delta.length_squared() < 1e-10f) {
+			return false;
+		}
+		r_normal = delta.normalized();
+		return true;
+	}
+	return false;
 }
 
 } // namespace
@@ -427,22 +478,68 @@ bool Box3DPhysicsDirectSpaceState3D::test_body_motion(
 	filter.set_collision_mask(p_body.get_collision_mask());
 	filter.exclude.insert(p_body.get_rid());
 
-	const Box3DShapeProxy3D shape_proxy(first_shape, p_transform * p_body.get_shape_transform(0));
-	if (!shape_proxy.is_supported()) {
-		p_result->travel = p_motion;
-		p_result->remainder = Vector3();
-		return false;
-	}
+	// A body resting on the ground settles a linear slop *inside* the surface, so a full-size
+	// sweep from that pose starts in contact. Shrinking the query shape past the slop lets
+	// most such sweeps report an ordinary touch instead. Godot's own safe_margin wins when it
+	// asks for more.
+	const float shrink = MAX((float)p_margin, 1.5f * B3_LINEAR_SLOP);
+	const Transform3D shape_transform = p_transform * p_body.get_shape_transform(0);
+	const Vector3 motion_dir = p_motion.normalized();
 
+	// Whatever the shrink leaves overlapping still reports the reverse of the cast direction
+	// as its normal, which reads as a head-on wall in every direction -- the floor underfoot
+	// would block a sideways step. So each contact's normal is recovered (witness_normal) and
+	// contacts the motion is not driving into are skipped by excluding that collider and
+	// casting again, which also uncovers the real blocker hiding behind the floor.
 	RayContext context;
-	context.filter = &filter;
+	Vector3 normal;
+	Box3DShapedObjectImpl3D* other = nullptr;
+	const int max_attempts = 4;
+	for (int attempt = 0; attempt < max_attempts; attempt++) {
+		const Box3DShapeProxy3D shape_proxy(first_shape, shape_transform, shrink);
+		if (!shape_proxy.is_supported()) {
+			p_result->travel = p_motion;
+			p_result->remainder = Vector3();
+			return false;
+		}
 
-	b3World_CastShape(space->get_world_id(), b3Vec3_zero, &shape_proxy.get_proxy(), godot_to_b3(p_motion), filter.filter, cast_result_fcn, &context);
+		context = RayContext();
+		context.filter = &filter;
+		b3World_CastShape(space->get_world_id(), b3Vec3_zero, &shape_proxy.get_proxy(), godot_to_b3(p_motion), filter.filter, cast_result_fcn, &context);
 
-	if (!context.has_hit) {
-		p_result->travel = p_motion;
-		p_result->remainder = Vector3();
-		return false;
+		if (!context.has_hit) {
+			p_result->travel = p_motion;
+			p_result->remainder = Vector3();
+			return false;
+		}
+
+		const b3BodyId body_id = b3Shape_GetBody(context.shape_id);
+		other = static_cast<Box3DShapedObjectImpl3D*>(b3Body_GetUserData(body_id));
+
+		normal = b3_to_godot(context.normal);
+		Vector3 recovered;
+		if (context.fraction <= 1e-4f && witness_normal(first_shape, shape_transform, context.shape_id, recovered)) {
+			normal = recovered;
+		}
+		if (normal.length_squared() < 1e-8f) {
+			// Nothing could describe this contact: the cores overlap as well. Reporting the
+			// reverse of the motion at least hands the caller a normalized vector to slide
+			// along instead of tripping its asserts.
+			normal = motion_dir == Vector3() ? Vector3(0, 1, 0) : -motion_dir;
+		}
+
+		const bool separating = motion_dir != Vector3() && normal.dot(motion_dir) > -1e-4f;
+		if (!separating || other == nullptr) {
+			break;
+		}
+		filter.exclude.insert(other->get_rid());
+		if (attempt == max_attempts - 1) {
+			// Out of attempts with nothing blocking found; treat the motion as unobstructed
+			// rather than reporting a contact the body is moving away from.
+			p_result->travel = p_motion;
+			p_result->remainder = Vector3();
+			return false;
+		}
 	}
 
 	p_result->travel = p_motion * context.fraction;
@@ -450,12 +547,10 @@ bool Box3DPhysicsDirectSpaceState3D::test_body_motion(
 	p_result->collision_safe_fraction = context.fraction;
 	p_result->collision_unsafe_fraction = context.fraction;
 
-	const b3BodyId body_id = b3Shape_GetBody(context.shape_id);
-	auto* other = static_cast<Box3DShapedObjectImpl3D*>(b3Body_GetUserData(body_id));
 	if (other != nullptr && p_max_collisions > 0) {
 		PhysicsServer3DExtensionMotionCollision& collision = p_result->collisions[0];
 		collision.position = b3_to_godot(context.point);
-		collision.normal = b3_to_godot(context.normal);
+		collision.normal = normal;
 		collision.collider = other->get_rid();
 		collision.collider_id = other->get_instance_id();
 		collision.collider_shape = 0;
