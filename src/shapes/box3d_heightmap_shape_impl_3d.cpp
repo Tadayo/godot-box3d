@@ -79,7 +79,9 @@ void Box3DHeightMapShapeImpl3D::_rebuild() {
 	b3HeightFieldDef def = {};
 	def.heights = heights.ptrw();
 	def.materialIndices = nullptr;
-	def.scale = b3Vec3{1.0f, 1.0f, 1.0f};
+	// Grid spacing is baked in here -- Box3D has no runtime scale for a height field. See
+	// get_height_field(), which rebuilds when a differently scaled body asks for one.
+	def.scale = b3Vec3{(float)built_scale.x, (float)built_scale.y, (float)built_scale.z};
 	def.countX = width;
 	def.countZ = depth;
 	def.globalMinimumHeight = min_height;
@@ -88,10 +90,25 @@ void Box3DHeightMapShapeImpl3D::_rebuild() {
 
 	height_field = b3CreateHeightField(&def);
 
-	const float half_x = (float)(width - 1) * 0.5f;
-	const float half_z = (float)(depth - 1) * 0.5f;
+	const float span_x = (float)(width - 1) * (float)built_scale.x;
+	const float span_z = (float)(depth - 1) * (float)built_scale.z;
 	aabb = AABB(
-		Vector3(-half_x, min_height, -half_z),
-		Vector3((float)(width - 1), max_height - min_height, (float)(depth - 1))
+		Vector3(-span_x * 0.5f, min_height * (float)built_scale.y, -span_z * 0.5f),
+		Vector3(span_x, (max_height - min_height) * (float)built_scale.y, span_z)
 	);
+}
+
+const b3HeightFieldData* Box3DHeightMapShapeImpl3D::get_height_field(const Vector3& p_scale) {
+	// All components must be positive (b3HeightFieldDef contract) and a mirrored scale has
+	// no meaning for a grid, so magnitudes are used.
+	const Vector3 wanted(
+			MAX((real_t)Math::abs(p_scale.x), (real_t)0.0001),
+			MAX((real_t)Math::abs(p_scale.y), (real_t)0.0001),
+			MAX((real_t)Math::abs(p_scale.z), (real_t)0.0001));
+	if (height_field != nullptr && built_scale.is_equal_approx(wanted)) {
+		return height_field;
+	}
+	built_scale = wanted;
+	_rebuild();
+	return height_field;
 }

@@ -89,8 +89,28 @@ private:
 
 	void _destroy_shape_instance(Box3DShapeInstance3D& p_instance);
 
+	// Recomputes height_field_offset from the current shape set and body scale. Returns true
+	// if it changed, meaning the live shapes and the b3 body transform are both stale.
+	bool _update_height_field_offset();
+
+	// Pushes cached_transform to the b3 body, shifted by height_field_offset.
+	void _apply_transform_to_body();
+
 	LocalVector<Box3DShapeInstance3D> shapes;
 
 	// Cached so the transform is available even while detached from a space (no body_id).
 	Transform3D cached_transform;
+
+	// Box3D pins a height field's grid corner to the body origin and offers no way to move
+	// it (b3CreateHeightFieldShape takes no transform, b3ShapeDef has no local transform),
+	// while Godot centres the grid on the shape. The b3 body is therefore placed this much
+	// away from the Godot body -- unrotated, in body space -- so the grid lands where Godot
+	// draws it. get_transform()/set_transform() add and remove it, and every non-height
+	// shape on the same body is shifted by its inverse so it stays put. Zero unless this
+	// body carries a height field, which is the overwhelmingly common case.
+	Vector3 height_field_offset;
+
+	// Body scale the live shapes were built against. Height fields bake grid spacing in at
+	// build time, so a scale change has to rebuild them.
+	Vector3 built_scale = Vector3(1, 1, 1);
 };

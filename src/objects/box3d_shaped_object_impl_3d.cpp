@@ -29,7 +29,9 @@ b3ShapeId create_box3d_shape(
 		bool p_is_sensor,
 		void* p_user_data,
 		float p_friction,
-		float p_restitution) {
+		float p_restitution,
+		const Vector3& p_body_scale,
+		const Vector3& p_height_field_offset) {
 	Box3DShapeImpl3D* shape = p_instance.get_shape();
 	if (shape == nullptr || p_instance.is_disabled()) {
 		return b3_nullShapeId;
@@ -50,7 +52,13 @@ b3ShapeId create_box3d_shape(
 	def.baseMaterial.friction = p_friction;
 	def.baseMaterial.restitution = p_restitution;
 
-	const Transform3D& local = p_instance.get_transform();
+	// When this body carries a height field its b3 body sits at an offset (see
+	// Box3DShapedObjectImpl3D::height_field_offset); every other shape cancels that out so
+	// it stays where Godot put it.
+	Transform3D local = p_instance.get_transform();
+	if (type != PhysicsServer3D::SHAPE_HEIGHTMAP) {
+		local.origin -= p_height_field_offset;
+	}
 
 	switch (type) {
 		case PhysicsServer3D::SHAPE_SPHERE: {
@@ -135,7 +143,11 @@ b3ShapeId create_box3d_shape(
 
 		case PhysicsServer3D::SHAPE_HEIGHTMAP: {
 			auto* height_shape = static_cast<Box3DHeightMapShapeImpl3D*>(shape);
-			const b3HeightFieldData* height_field = height_shape->get_height_field();
+			// Grid spacing is baked into the field, so the body's scale has to be known
+			// here. The matching translation lives on the body -- Box3D pins the grid
+			// corner to the body origin and gives no way to move it.
+			const Vector3 grid_scale = p_body_scale * local.basis.get_scale();
+			const b3HeightFieldData* height_field = height_shape->get_height_field(grid_scale);
 			if (height_field == nullptr) {
 				return b3_nullShapeId;
 			}
@@ -183,18 +195,62 @@ Box3DShapedObjectImpl3D::~Box3DShapedObjectImpl3D() {
 }
 
 Transform3D Box3DShapedObjectImpl3D::get_transform() const {
-	if (has_body_id()) {
+	if (has_body_id() && height_field_offset == Vector3()) {
 		return b3_to_godot(b3Body_GetTransform(body_id));
 	}
+	// A height field forces a static body (Box3D's own restriction), so the solver never
+	// moves this one and the cached transform is authoritative. It also still carries the
+	// scale a b3Transform cannot represent.
 	return cached_transform;
 }
 
 void Box3DShapedObjectImpl3D::set_transform(const Transform3D& p_transform) {
+	const Vector3 previous_scale = cached_transform.basis.get_scale();
 	cached_transform = p_transform;
-	if (has_body_id()) {
-		const b3Transform t = godot_to_b3_transform(p_transform);
-		b3Body_SetTransform(body_id, t.p, t.q);
+
+	// Height fields bake grid spacing in at build time, so a rescaled body needs its shapes
+	// rebuilt -- and the rebuild is what recomputes height_field_offset for the new scale.
+	if (has_body_id() && !previous_scale.is_equal_approx(p_transform.basis.get_scale())) {
+		rebuild_shapes();
+		return;
 	}
+
+	_apply_transform_to_body();
+}
+
+void Box3DShapedObjectImpl3D::_apply_transform_to_body() {
+	if (!has_body_id()) {
+		return;
+	}
+	Transform3D placed = cached_transform;
+	if (height_field_offset != Vector3()) {
+		// The offset is expressed in unscaled body space, so only the rotation applies.
+		placed.origin += cached_transform.basis.orthonormalized().xform(height_field_offset);
+	}
+	const b3Transform t = godot_to_b3_transform(placed);
+	b3Body_SetTransform(body_id, t.p, t.q);
+}
+
+bool Box3DShapedObjectImpl3D::_update_height_field_offset() {
+	const Vector3 body_scale = cached_transform.basis.get_scale();
+	Vector3 offset;
+	for (uint32_t i = 0; i < shapes.size(); i++) {
+		Box3DShapeImpl3D* shape = shapes[i].get_shape();
+		if (shape == nullptr || shapes[i].is_disabled() || shape->get_type() != PhysicsServer3D::SHAPE_HEIGHTMAP) {
+			continue;
+		}
+		const Transform3D& local = shapes[i].get_transform();
+		auto* height_shape = static_cast<Box3DHeightMapShapeImpl3D*>(shape);
+		offset = local.origin + height_shape->centre_offset(body_scale * local.basis.get_scale());
+		// Only one height field can dictate the body frame; a second would need its own
+		// body, which Godot never asks for in practice.
+		break;
+	}
+
+	const bool changed = !offset.is_equal_approx(height_field_offset) || !built_scale.is_equal_approx(body_scale);
+	height_field_offset = offset;
+	built_scale = body_scale;
+	return changed;
 }
 
 void Box3DShapedObjectImpl3D::add_shape(Box3DShapeImpl3D* p_shape, const Transform3D& p_transform, bool p_disabled) {
@@ -204,8 +260,9 @@ void Box3DShapedObjectImpl3D::add_shape(Box3DShapeImpl3D* p_shape, const Transfo
 	shapes.push_back(instance);
 
 	if (has_body_id()) {
-		_create_shape_instance(shapes[shapes.size() - 1]);
-		_shapes_changed();
+		// Via rebuild_shapes rather than _create_shape_instance: adding a height field moves
+		// the body frame, which invalidates every shape already on it.
+		rebuild_shapes();
 	}
 }
 
@@ -224,6 +281,9 @@ void Box3DShapedObjectImpl3D::remove_shape(int32_t p_index) {
 	for (uint32_t i = p_index; i < shapes.size(); i++) {
 		shapes[i].set_index(i);
 	}
+	if (has_body_id()) {
+		rebuild_shapes();
+	}
 	_shapes_changed();
 }
 
@@ -232,7 +292,7 @@ void Box3DShapedObjectImpl3D::set_shape(int32_t p_index, Box3DShapeImpl3D* p_sha
 	_destroy_shape_instance(shapes[p_index]);
 	shapes[p_index].set_shape(p_shape);
 	if (has_body_id()) {
-		_create_shape_instance(shapes[p_index]);
+		rebuild_shapes();
 	}
 	_shapes_changed();
 }
@@ -271,7 +331,9 @@ void Box3DShapedObjectImpl3D::set_shape_transform(int32_t p_index, const Transfo
 	instance.set_transform(p_transform);
 	if (instance.has_shape_id()) {
 		_destroy_shape_instance(instance);
-		_create_shape_instance(instance);
+		// Moving a height field moves the body frame with it, so the rest of the shapes on
+		// this body have to follow; rebuild_shapes() no-ops on the ones already live.
+		rebuild_shapes();
 		_shapes_changed();
 	}
 }
@@ -321,6 +383,15 @@ void Box3DShapedObjectImpl3D::rebuild_shapes() {
 	if (!has_body_id()) {
 		return;
 	}
+	// The offset depends on the shape set and the body scale, and every shape is built
+	// relative to it, so it has to be settled before any shape is created. Anything already
+	// live was built against the old offset and has to go.
+	if (_update_height_field_offset()) {
+		for (auto& instance : shapes) {
+			_destroy_shape_instance(instance);
+		}
+		_apply_transform_to_body();
+	}
 	for (auto& instance : shapes) {
 		if (!instance.is_disabled()) {
 			_create_shape_instance(instance);
@@ -343,7 +414,7 @@ void Box3DShapedObjectImpl3D::_create_shape_instance(Box3DShapeInstance3D& p_ins
 	if (p_instance.has_shape_id() || !has_body_id()) {
 		return;
 	}
-	const b3ShapeId shape_id = create_box3d_shape(body_id, p_instance, collision_layer, collision_mask, _is_sensor_body(), &p_instance, _get_shape_friction(), _get_shape_restitution());
+	const b3ShapeId shape_id = create_box3d_shape(body_id, p_instance, collision_layer, collision_mask, _is_sensor_body(), &p_instance, _get_shape_friction(), _get_shape_restitution(), cached_transform.basis.get_scale(), height_field_offset);
 	p_instance.set_shape_id(shape_id);
 }
 
