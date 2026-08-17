@@ -1,14 +1,19 @@
 #include "box3d_physics_direct_space_state_3d.hpp"
 
+#include "../misc/box3d_globals.hpp"
 #include "../misc/box3d_shape_proxy.hpp"
 #include "../misc/type_conversions.hpp"
 #include "../objects/box3d_area_impl_3d.hpp"
 #include "../objects/box3d_body_impl_3d.hpp"
 #include "../objects/box3d_shaped_object_impl_3d.hpp"
 #include "../servers/box3d_physics_server_3d.hpp"
+#include "../shapes/box3d_capsule_shape_impl_3d.hpp"
 #include "../shapes/box3d_shape_impl_3d.hpp"
 #include "box3d_query_filter_3d.hpp"
 #include "box3d_space_3d.hpp"
+
+#include <godot_cpp/classes/os.hpp>
+#include <godot_cpp/variant/utility_functions.hpp>
 
 #include <box3d/box3d.h>
 #include <box3d/constants.h> // B3_LINEAR_SLOP
@@ -189,6 +194,113 @@ bool witness_normal(
 		return true;
 	}
 	return false;
+}
+
+// --- character mover -------------------------------------------------------
+//
+// Box3D has a first-class kinematic character API and it is the documented way
+// to move a capsule: b3World_CastMover sweeps one while "handling sliding along
+// other shapes while reducing clipping", and b3World_CollideMover gathers the
+// contact planes -- the docs are explicit that the cast is not a good source of
+// touch information and the planes are. Between them they answer exactly what
+// Godot's CharacterBody3D asks test_body_motion, and they replace the generic
+// shape-cast path's shrink / GJK-witness / re-cast dance for capsules.
+
+// Room for the planes one capsule can touch at once. A character in a corner
+// sees three or four; the cap is generous and simply stops collecting past it.
+constexpr int MOVER_MAX_PLANES = 16;
+
+struct MoverContext {
+	const Box3DQueryFilter3D* filter = nullptr;
+	// Most-opposed plane found so far.
+	Vector3 normal;
+	Vector3 point;
+	float opposition = 0.0f; // -dot(normal, motion_dir); larger is more head-on
+	Vector3 motion_dir;
+	b3ShapeId shape_id = b3_nullShapeId;
+	bool has_plane = false;
+	b3Plane planes[MOVER_MAX_PLANES];
+	int count = 0;
+};
+
+bool mover_filter_fcn(b3ShapeId p_shape_id, void* p_context) {
+	auto* ctx = static_cast<MoverContext*>(p_context);
+	const b3BodyId body_id = b3Shape_GetBody(p_shape_id);
+	Box3DShapedObjectImpl3D* object = nullptr;
+	return should_report(b3Body_GetUserData(body_id), *ctx->filter, object);
+}
+
+bool mover_plane_fcn(b3ShapeId p_shape_id, const b3PlaneResult* p_plane, int, void* p_context) {
+	auto* ctx = static_cast<MoverContext*>(p_context);
+	const b3BodyId body_id = b3Shape_GetBody(p_shape_id);
+	Box3DShapedObjectImpl3D* object = nullptr;
+	if (!should_report(b3Body_GetUserData(body_id), *ctx->filter, object)) {
+		return true;
+	}
+
+	const Vector3 normal = b3_to_godot(p_plane->plane.normal);
+	if (normal.length_squared() < 1e-8f) {
+		return true;
+	}
+	// Keep the plane the motion drives into hardest. A body standing on the floor
+	// and stepping sideways gets a floor plane whose opposition is ~0, so the
+	// floor never masks the wall in front -- the case the generic path needed a
+	// whole re-cast loop to handle.
+	const float opposition = -(float)normal.dot(ctx->motion_dir);
+	if (!ctx->has_plane || opposition > ctx->opposition) {
+		ctx->has_plane = true;
+		ctx->opposition = opposition;
+		ctx->normal = normal;
+		ctx->point = b3_to_godot(p_plane->point);
+		ctx->shape_id = p_shape_id;
+	}
+
+	if (ctx->count < MOVER_MAX_PLANES) {
+		ctx->planes[ctx->count++] = p_plane->plane;
+	}
+	return true;
+}
+
+// How much of p_motion a capsule can travel before it reaches p_plane, as a
+// fraction of the whole motion. Box3D's plane convention is
+// separation = dot(normal, point) - offset (see hull.c), and everything here is
+// in the mover's origin-relative frame, so no conversion is involved.
+//
+// This replaces the obvious use of b3SolvePlanes. That solves a POSITION -- it
+// hands back a delta already slid along the floor -- and projecting that onto the
+// motion line under-reports how far along the line the body got, which measured
+// as walk speed collapsing from 7.5 to 0.42 m/s. Godot's contract wants distance
+// along the motion before something blocks it, and does its own sliding.
+float plane_travel_fraction(const b3Plane& p_plane, const b3Capsule& p_mover, const b3Vec3& p_motion) {
+	const float closing = -(p_plane.normal.x * p_motion.x + p_plane.normal.y * p_motion.y + p_plane.normal.z * p_motion.z);
+	if (closing <= 1e-6f) {
+		// Parallel to the plane, or moving away from it. The floor underfoot while
+		// walking along it lands here, which is exactly why walking is not slowed.
+		return 1.0f;
+	}
+	const float d1 = p_plane.normal.x * p_mover.center1.x + p_plane.normal.y * p_mover.center1.y + p_plane.normal.z * p_mover.center1.z;
+	const float d2 = p_plane.normal.x * p_mover.center2.x + p_plane.normal.y * p_mover.center2.y + p_plane.normal.z * p_mover.center2.z;
+	const float separation = MIN(d1, d2) - p_plane.offset - p_mover.radius;
+	if (separation <= 0.0f) {
+		return 0.0f;
+	}
+	return CLAMP(separation / closing, 0.0f, 1.0f);
+}
+
+// Builds the b3Capsule a Godot capsule shape describes, in world space but
+// expressed relative to p_origin the way the mover API wants it.
+bool build_mover(const Box3DShapeImpl3D* p_shape, const Transform3D& p_transform,
+		const Vector3& p_origin, b3Capsule& r_mover) {
+	if (p_shape == nullptr || p_shape->get_type() != PhysicsServer3D::SHAPE_CAPSULE) {
+		return false;
+	}
+	const auto* capsule = static_cast<const Box3DCapsuleShapeImpl3D*>(p_shape);
+	const float radius = (float)capsule->get_radius();
+	const float half_seg = MAX(0.0f, (float)capsule->get_height() * 0.5f - radius);
+	r_mover.center1 = godot_to_b3(p_transform.xform(Vector3(0, half_seg, 0)) - p_origin);
+	r_mover.center2 = godot_to_b3(p_transform.xform(Vector3(0, -half_seg, 0)) - p_origin);
+	r_mover.radius = radius;
+	return true;
 }
 
 } // namespace
@@ -478,6 +590,15 @@ bool Box3DPhysicsDirectSpaceState3D::test_body_motion(
 	filter.set_collision_mask(p_body.get_collision_mask());
 	filter.exclude.insert(p_body.get_rid());
 
+	if (box3d_use_character_mover()) {
+		const Transform3D mover_transform = p_transform * p_body.get_shape_transform(0);
+		b3Capsule mover;
+		if (build_mover(first_shape, mover_transform, mover_transform.origin, mover)) {
+			return _test_mover_motion(
+					p_body, mover, mover_transform.origin, p_motion, filter, p_max_collisions, p_result);
+		}
+	}
+
 	// A body resting on the ground settles a linear slop *inside* the surface, so a full-size
 	// sweep from that pose starts in contact. Shrinking the query shape past the slop lets
 	// most such sweeps report an ordinary touch instead. Godot's own safe_margin wins when it
@@ -553,6 +674,124 @@ bool Box3DPhysicsDirectSpaceState3D::test_body_motion(
 		collision.normal = normal;
 		collision.collider = other->get_rid();
 		collision.collider_id = other->get_instance_id();
+		collision.collider_shape = 0;
+		collision.depth = 0.0f;
+		p_result->collision_count = 1;
+	}
+
+	return true;
+}
+
+// Capsule bodies -- every CharacterBody3D in practice -- go through Box3D's own
+// character API instead of the generic shape cast above. Two calls, in the order
+// the docs prescribe: sweep with b3World_CastMover for how far the motion gets,
+// then b3World_CollideMover AT THE STOP POSE for what it ran into. Collecting
+// planes at the start pose instead would miss a wall the body has not reached
+// yet, which is most of them.
+bool Box3DPhysicsDirectSpaceState3D::_test_mover_motion(
+		Box3DShapedObjectImpl3D& p_body,
+		const b3Capsule& p_mover,
+		const Vector3& p_origin,
+		const Vector3& p_motion,
+		const Box3DQueryFilter3D& p_filter,
+		int32_t p_max_collisions,
+		PhysicsServer3DExtensionMotionResult* p_result) const {
+	const Vector3 motion_dir = p_motion.normalized();
+	const real_t motion_len = p_motion.length();
+	if (motion_dir == Vector3() || motion_len <= 0.0f) {
+		p_result->travel = p_motion;
+		p_result->remainder = Vector3();
+		return false;
+	}
+
+	const b3WorldId world_id = space->get_world_id();
+	const b3Pos origin = godot_to_b3(p_origin);
+
+	// STEP 1 -- what is the mover already touching? These planes are what stops a
+	// body resting on the ground from sinking through it. b3World_CastMover alone
+	// will not: it lets the capsule encroach by up to a slop to reduce clipping, so
+	// a sub-slop downward step reads as unobstructed and the body creeps down a
+	// little every tick.
+	//
+	// Both this pose and the stop pose below are needed, and cheaper orderings do
+	// not work. Gathering planes only where the sweep stops loses the floor while a
+	// body is pressed against a wall -- it sinks and then walks through, measured.
+	MoverContext at_start;
+	at_start.filter = &p_filter;
+	at_start.motion_dir = motion_dir;
+	b3Capsule here = p_mover;
+	b3World_CollideMover(world_id, origin, &here, p_filter.filter, mover_plane_fcn, &at_start);
+
+	// STEP 2 -- how much of the motion survives those planes.
+	real_t plane_fraction = 1.0f;
+	const b3Vec3 motion_b3 = godot_to_b3(p_motion);
+	for (int i = 0; i < at_start.count; i++) {
+		plane_fraction = MIN(plane_fraction, (real_t)plane_travel_fraction(at_start.planes[i], p_mover, motion_b3));
+	}
+
+	// STEP 3 -- and how far the sweep gets before reaching something not yet touched.
+	MoverContext sweep;
+	sweep.filter = &p_filter;
+	sweep.motion_dir = motion_dir;
+	const real_t cast_fraction = CLAMP((real_t)b3World_CastMover(world_id, origin, &p_mover,
+											   godot_to_b3(p_motion), p_filter.filter, mover_filter_fcn, &sweep),
+			(real_t)0.0, (real_t)1.0);
+
+	const real_t fraction = MIN(plane_fraction, cast_fraction);
+
+	// Where to read the contact normal. A plane the body is ALREADY touching answers
+	// for free -- it was gathered above -- so the second gather is reserved for the
+	// case that genuinely needs it: the sweep ran into something not touched yet and
+	// nothing underfoot opposes the motion. Gathering unconditionally instead costs
+	// roughly 3x on the benchmark, because collecting planes against a height field
+	// is the expensive half of this whole path.
+	MoverContext* contact = &at_start;
+	Vector3 contact_origin = p_origin;
+	MoverContext at_stop;
+	const bool start_opposes = at_start.has_plane && at_start.opposition > 1e-4f;
+	if (!start_opposes && cast_fraction < 0.999f) {
+		contact_origin = p_origin + p_motion * fraction;
+		at_stop.filter = &p_filter;
+		at_stop.motion_dir = motion_dir;
+		b3Capsule stopped = p_mover;
+		b3World_CollideMover(
+				world_id, godot_to_b3(contact_origin), &stopped, p_filter.filter, mover_plane_fcn, &at_stop);
+		contact = &at_stop;
+	}
+
+	// Nothing opposing the motion: a body walking along the floor it stands on
+	// reaches here, and that is the point of the mover -- the floor does not stop
+	// it. Reporting a contact anyway would make Godot slide against its own ground.
+	const bool blocked = contact->has_plane && contact->opposition > 1e-4f;
+	if (fraction >= 1.0f && !blocked) {
+		p_result->travel = p_motion;
+		p_result->remainder = Vector3();
+		return false;
+	}
+	if (!blocked) {
+		p_result->travel = p_motion * fraction;
+		p_result->remainder = p_motion * (1.0f - fraction);
+		p_result->collision_safe_fraction = fraction;
+		p_result->collision_unsafe_fraction = fraction;
+		return false;
+	}
+
+	p_result->travel = p_motion * fraction;
+	p_result->remainder = p_motion * (1.0f - fraction);
+	p_result->collision_safe_fraction = fraction;
+	p_result->collision_unsafe_fraction = fraction;
+
+	if (p_max_collisions > 0) {
+		Box3DShapedObjectImpl3D* other = nullptr;
+		if (B3_IS_NON_NULL(contact->shape_id)) {
+			other = static_cast<Box3DShapedObjectImpl3D*>(b3Body_GetUserData(b3Shape_GetBody(contact->shape_id)));
+		}
+		PhysicsServer3DExtensionMotionCollision& collision = p_result->collisions[0];
+		// Plane points come back relative to the origin they were gathered at.
+		collision.position = contact_origin + contact->point;
+		collision.normal = contact->normal;
+		collision.collider = other != nullptr ? other->get_rid() : RID();
+		collision.collider_id = other != nullptr ? other->get_instance_id() : ObjectID();
 		collision.collider_shape = 0;
 		collision.depth = 0.0f;
 		p_result->collision_count = 1;

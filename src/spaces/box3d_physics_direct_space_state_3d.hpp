@@ -5,10 +5,13 @@
 #include <godot_cpp/classes/physics_server3d_extension_shape_rest_info.hpp>
 #include <godot_cpp/classes/physics_server3d_extension_shape_result.hpp>
 
+#include <box3d/types.h>
+
 using namespace godot;
 
 class Box3DShapedObjectImpl3D;
 class Box3DSpace3D;
+struct Box3DQueryFilter3D;
 
 // Query overrides: raycasts and shape queries against one Box3DSpace3D. Box3D's own filter
 // (b3QueryFilter) has no native per-query RID-exclude list, so a side-channel HashSet<RID>
@@ -101,5 +104,17 @@ protected:
 	static void _bind_methods() {}
 
 private:
+	// Capsule bodies take Box3D's own character-mover path instead of the generic
+	// shape cast: b3World_CastMover for the distance, b3World_CollideMover at the
+	// stop pose for the contact. Only test_body_motion calls this.
+	bool _test_mover_motion(
+			Box3DShapedObjectImpl3D& p_body,
+			const b3Capsule& p_mover,
+			const Vector3& p_origin,
+			const Vector3& p_motion,
+			const Box3DQueryFilter3D& p_filter,
+			int32_t p_max_collisions,
+			PhysicsServer3DExtensionMotionResult* p_result) const;
+
 	Box3DSpace3D* space = nullptr;
 };
