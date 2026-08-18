@@ -146,13 +146,73 @@ float cast_result_fcn(b3ShapeId p_shape_id, b3Pos p_point, b3Vec3 p_normal, floa
 	return p_fraction;
 }
 
+// Ray half of witness_normal, for colliders with no convex core (mesh, heightfield): the
+// surface under a contact still answers a ray. One is fired from the query shape's centre
+// through the reported contact point and the normal of the crossed triangle is read back.
+// The callback clips to the target collider alone -- anything else along the ray is another
+// contact's business, not this one's.
+struct WitnessRayContext {
+	const void* target_user_data = nullptr;
+	bool has_hit = false;
+	b3Vec3 normal{};
+};
+
+float witness_ray_fcn(b3ShapeId p_shape_id, b3Pos, b3Vec3 p_normal, float p_fraction, uint64_t, int, int, void* p_context) {
+	auto* ctx = static_cast<WitnessRayContext*>(p_context);
+	const b3BodyId body_id = b3Shape_GetBody(p_shape_id);
+	if (b3Body_GetUserData(body_id) != ctx->target_user_data) {
+		return -1.0f; // Not the collider being described; skip it and keep casting.
+	}
+	ctx->has_hit = true;
+	ctx->normal = p_normal;
+	return p_fraction; // Clip: keep the nearest crossing of the target.
+}
+
+bool ray_witness_normal(
+		b3WorldId p_world,
+		const Box3DShapedObjectImpl3D* p_target,
+		const Vector3& p_from,
+		const Vector3& p_contact,
+		Vector3& r_normal) {
+	Vector3 dir = p_contact - p_from;
+	const float len = (float)dir.length();
+	if (len < 1e-6f) {
+		return false;
+	}
+	dir /= len;
+	// Overshoot past the contact: a resting body's contact point sits ON the surface (or a
+	// slop inside it), and a ray that stops exactly there may not register the crossing.
+	const Vector3 translation = dir * (len + 0.25f);
+
+	WitnessRayContext context;
+	context.target_user_data = p_target;
+	b3World_CastRay(p_world, godot_to_b3(p_from), godot_to_b3(translation), b3DefaultQueryFilter(), witness_ray_fcn, &context);
+	if (!context.has_hit) {
+		return false;
+	}
+	Vector3 normal = b3_to_godot(context.normal);
+	if (normal.length_squared() < 1e-8f) {
+		return false;
+	}
+	if (normal.dot(dir) > 0.0f) {
+		normal = -normal; // Face the query shape, whichever winding the triangle had.
+	}
+	r_normal = normal.normalized();
+	return true;
+}
+
 // Recovers the surface normal for a contact the shape cast could not describe. A cast that
 // starts already touching reports the reverse of its own direction, so the floor a body is
 // standing on looks like a head-on wall no matter which way the body tries to move. GJK
 // between the two CORE shapes -- radii excluded, so a resting capsule's inner segment still
 // stands clear of the floor it is sunk into -- recovers the direction that separates them.
+// Concave colliders (mesh, heightfield) have no convex core for GJK, so their normal comes
+// from ray_witness_normal above instead -- without that a frame standing on a mesh floor is
+// pinned in place exactly the way the un-patched cast pinned one on a box floor.
 // Returns false when the cores overlap too (deep penetration), where GJK has nothing to say.
 bool witness_normal(
+		b3WorldId p_world,
+		const Vector3& p_contact,
 		const Box3DShapeImpl3D* p_shape,
 		const Transform3D& p_transform,
 		b3ShapeId p_other_shape_id,
@@ -175,7 +235,7 @@ bool witness_normal(
 		}
 		const Box3DShapeProxy3D other_proxy(other->get_shape(i), other_transform * other->get_shape_transform(i));
 		if (!other_proxy.is_supported()) {
-			return false;
+			return ray_witness_normal(p_world, other, p_transform.origin, p_contact, r_normal);
 		}
 
 		b3DistanceInput input{};
@@ -639,7 +699,7 @@ bool Box3DPhysicsDirectSpaceState3D::test_body_motion(
 
 		normal = b3_to_godot(context.normal);
 		Vector3 recovered;
-		if (context.fraction <= 1e-4f && witness_normal(first_shape, shape_transform, context.shape_id, recovered)) {
+		if (context.fraction <= 1e-4f && witness_normal(space->get_world_id(), b3_to_godot(context.point), first_shape, shape_transform, context.shape_id, recovered)) {
 			normal = recovered;
 		}
 		if (normal.length_squared() < 1e-8f) {
