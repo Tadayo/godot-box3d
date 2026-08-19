@@ -400,6 +400,24 @@ void Box3DShapedObjectImpl3D::rebuild_shapes() {
 	_shapes_changed();
 }
 
+void Box3DShapedObjectImpl3D::on_shape_data_changed(const Box3DShapeImpl3D* p_shape) {
+	if (!has_body_id()) {
+		return;
+	}
+	bool stale = false;
+	for (auto& instance : shapes) {
+		if (instance.get_shape() == p_shape) {
+			// May be a no-op when the shape was attached with no data yet (its
+			// creation was skipped); rebuild_shapes() below creates it fresh.
+			_destroy_shape_instance(instance);
+			stale = true;
+		}
+	}
+	if (stale) {
+		rebuild_shapes();
+	}
+}
+
 void Box3DShapedObjectImpl3D::_destroy_body_id() {
 	if (has_body_id()) {
 		for (auto& instance : shapes) {

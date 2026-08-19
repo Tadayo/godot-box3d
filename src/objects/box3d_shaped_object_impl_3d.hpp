@@ -60,6 +60,12 @@ public:
 	// space, and after body type transitions that need shapes recreated).
 	void rebuild_shapes();
 
+	// One of this object's attached shapes got new data via shape_set_data. The live b3
+	// shape was built from the OLD data (or was never built at all, when the shape was
+	// attached empty and filled in later -- exactly CSGShape3D's use_collision flow, which
+	// otherwise stays a dead collider forever). Drop the stale instance(s) and rebuild.
+	void on_shape_data_changed(const Box3DShapeImpl3D* p_shape);
+
 protected:
 	// Creates the underlying b3BodyId in the given world using the cached construction
 	// state (transform, velocities, ...). Subclasses fill in body-type-specific fields.
