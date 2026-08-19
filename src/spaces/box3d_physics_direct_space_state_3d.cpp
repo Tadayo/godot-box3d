@@ -132,6 +132,9 @@ struct RayContext {
 float cast_result_fcn(b3ShapeId p_shape_id, b3Pos p_point, b3Vec3 p_normal, float p_fraction, uint64_t, int, int, void* p_context) {
 	auto* ctx = static_cast<RayContext*>(p_context);
 
+	if (ctx->filter->should_exclude_shape(p_shape_id)) {
+		return -1.0f;
+	}
 	const b3BodyId body_id = b3Shape_GetBody(p_shape_id);
 	Box3DShapedObjectImpl3D* object = nullptr;
 	if (!should_report(b3Body_GetUserData(body_id), *ctx->filter, object)) {
@@ -713,7 +716,10 @@ bool Box3DPhysicsDirectSpaceState3D::test_body_motion(
 		if (!separating || other == nullptr) {
 			break;
 		}
-		filter.exclude.insert(other->get_rid());
+		// Drop just the settled contact's SHAPE, not the collider: excluding the RID took
+		// every shape of a multi-shape body with it, so a capsule standing on a wreck's
+		// floor shape walked straight through that wreck's wall shapes.
+		filter.exclude_shapes.insert(b3StoreShapeId(context.shape_id));
 		if (attempt == max_attempts - 1) {
 			// Out of attempts with nothing blocking found; treat the motion as unobstructed
 			// rather than reporting a contact the body is moving away from.
