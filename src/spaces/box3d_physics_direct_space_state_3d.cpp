@@ -269,10 +269,9 @@ bool witness_normal(
 // Godot's CharacterBody3D asks test_body_motion, and they replace the generic
 // shape-cast path's shrink / GJK-witness / re-cast dance for capsules.
 
-// Room for the planes one capsule can touch at once. A character in a corner
-// sees three or four; the cap is generous and simply stops collecting past it.
-constexpr int MOVER_MAX_PLANES = 16;
-
+// Only the most-opposed plane is ever read, so nothing keeps the rest. An
+// earlier version buffered sixteen of them for a per-plane travel fraction that
+// no longer exists.
 struct MoverContext {
 	const Box3DQueryFilter3D* filter = nullptr;
 	// Most-opposed plane found so far.
@@ -282,8 +281,6 @@ struct MoverContext {
 	Vector3 motion_dir;
 	b3ShapeId shape_id = b3_nullShapeId;
 	bool has_plane = false;
-	b3Plane planes[MOVER_MAX_PLANES];
-	int count = 0;
 };
 
 bool mover_filter_fcn(b3ShapeId p_shape_id, void* p_context) {
@@ -317,38 +314,35 @@ bool mover_plane_fcn(b3ShapeId p_shape_id, const b3PlaneResult* p_plane, int, vo
 		ctx->point = b3_to_godot(p_plane->point);
 		ctx->shape_id = p_shape_id;
 	}
-
-	if (ctx->count < MOVER_MAX_PLANES) {
-		ctx->planes[ctx->count++] = p_plane->plane;
-	}
 	return true;
 }
 
-// How much of p_motion a capsule can travel before it reaches p_plane, as a
-// fraction of the whole motion. Box3D's plane convention is
-// separation = dot(normal, point) - offset (see hull.c), and everything here is
-// in the mover's origin-relative frame, so no conversion is involved.
+// A contact plane's answer to "how much of this motion survives?" is binary, so
+// MoverContext::opposition is the whole test and no per-plane fraction exists.
 //
-// This replaces the obvious use of b3SolvePlanes. That solves a POSITION -- it
-// hands back a delta already slid along the floor -- and projecting that onto the
-// motion line under-reports how far along the line the body got, which measured
-// as walk speed collapsing from 7.5 to 0.42 m/s. Godot's contract wants distance
-// along the motion before something blocks it, and does its own sliding.
-float plane_travel_fraction(const b3Plane& p_plane, const b3Capsule& p_mover, const b3Vec3& p_motion) {
-	const float closing = -(p_plane.normal.x * p_motion.x + p_plane.normal.y * p_motion.y + p_plane.normal.z * p_motion.z);
-	if (closing <= 1e-6f) {
-		// Parallel to the plane, or moving away from it. The floor underfoot while
-		// walking along it lands here, which is exactly why walking is not slowed.
-		return 1.0f;
-	}
-	const float d1 = p_plane.normal.x * p_mover.center1.x + p_plane.normal.y * p_mover.center1.y + p_plane.normal.z * p_mover.center1.z;
-	const float d2 = p_plane.normal.x * p_mover.center2.x + p_plane.normal.y * p_mover.center2.y + p_plane.normal.z * p_mover.center2.z;
-	const float separation = MIN(d1, d2) - p_plane.offset - p_mover.radius;
-	if (separation <= 0.0f) {
-		return 0.0f;
-	}
-	return CLAMP(separation / closing, 0.0f, 1.0f);
-}
+// b3World_CollideMover only ever reports planes the mover is ALREADY touching:
+// height_field.c / mesh.c / hull.c emit one when the surface distance is within
+// the mover radius, and set offset = radius - distance, a penetration depth, not
+// a world-space plane offset. b3SolvePlanes reads it the same way -- its
+// separation is dot(normal, DELTA) - offset, a function of the movement, not of
+// a point. So at delta = 0 every reported plane already sits at separation
+// -offset <= 0: motion driving into one gets nothing and Godot slides the
+// remainder, motion along or away from one is unimpeded. There is no third case
+// for a fraction to describe.
+//
+// A plane_travel_fraction() helper used to live here and got that convention
+// wrong, feeding the mover's origin-relative capsule centres in where
+// b3SolvePlanes wants the delta. Those centres are symmetric about the origin,
+// so its MIN(d1, d2) was never positive and its expression could never clear
+// -radius: it returned exactly this 0/1 for every input it ever saw. Deleting it
+// keeps the behaviour and drops the trap.
+//
+// This is also why b3SolvePlanes is not called directly. It solves a POSITION --
+// it hands back a delta already slid along the floor -- and projecting that onto
+// the motion line under-reports how far along the line the body got, which
+// measured as walk speed collapsing from 7.5 to 0.42 m/s. Godot's contract wants
+// distance along the motion before something blocks it, and does its own sliding.
+constexpr float MOVER_OPPOSED = 1e-4f;
 
 // Builds the b3Capsule a Godot capsule shape describes, in world space but
 // expressed relative to p_origin the way the mover API wants it.
@@ -788,12 +782,10 @@ bool Box3DPhysicsDirectSpaceState3D::_test_mover_motion(
 	b3Capsule here = p_mover;
 	b3World_CollideMover(world_id, origin, &here, p_filter.filter, mover_plane_fcn, &at_start);
 
-	// STEP 2 -- how much of the motion survives those planes.
-	real_t plane_fraction = 1.0f;
-	const b3Vec3 motion_b3 = godot_to_b3(p_motion);
-	for (int i = 0; i < at_start.count; i++) {
-		plane_fraction = MIN(plane_fraction, (real_t)plane_travel_fraction(at_start.planes[i], p_mover, motion_b3));
-	}
+	// STEP 2 -- how much of the motion survives those planes. See MOVER_OPPOSED:
+	// a plane already in contact either stops the motion dead or ignores it.
+	const bool start_opposes = at_start.has_plane && at_start.opposition > MOVER_OPPOSED;
+	const real_t plane_fraction = start_opposes ? (real_t)0.0 : (real_t)1.0;
 
 	// STEP 3 -- and how far the sweep gets before reaching something not yet touched.
 	MoverContext sweep;
@@ -814,7 +806,6 @@ bool Box3DPhysicsDirectSpaceState3D::_test_mover_motion(
 	MoverContext* contact = &at_start;
 	Vector3 contact_origin = p_origin;
 	MoverContext at_stop;
-	const bool start_opposes = at_start.has_plane && at_start.opposition > 1e-4f;
 	if (!start_opposes && cast_fraction < 0.999f) {
 		contact_origin = p_origin + p_motion * fraction;
 		at_stop.filter = &p_filter;
@@ -828,17 +819,22 @@ bool Box3DPhysicsDirectSpaceState3D::_test_mover_motion(
 	// Nothing opposing the motion: a body walking along the floor it stands on
 	// reaches here, and that is the point of the mover -- the floor does not stop
 	// it. Reporting a contact anyway would make Godot slide against its own ground.
-	const bool blocked = contact->has_plane && contact->opposition > 1e-4f;
-	if (fraction >= 1.0f && !blocked) {
+	//
+	// The sweep's own fraction must be dropped with it, not passed on. A resting
+	// capsule sits a linear slop INSIDE the surface, so b3World_CastMover finds
+	// the next height-field cell or mesh triangle along already overlapping the
+	// capsule and stops the sweep against it -- against ground the motion runs
+	// ALONG, not into. Handing Godot a short travel with no collision is the worst
+	// of both answers: move_and_slide takes the travel and THROWS THE REMAINDER
+	// AWAY, because there is no normal to slide the rest along. That cost most of
+	// a tick of walk roughly every cell crossed: a three-second 7.5 m/s walk that
+	// should cover 22.50 m covered 20.11 m on a flat height field and 22.36 m on a
+	// flat trimesh, against 22.50 m exactly for the generic path on both. Nothing
+	// opposes, so nothing is in the way: report the motion as travelled in full.
+	const bool blocked = contact->has_plane && contact->opposition > MOVER_OPPOSED;
+	if (!blocked) {
 		p_result->travel = p_motion;
 		p_result->remainder = Vector3();
-		return false;
-	}
-	if (!blocked) {
-		p_result->travel = p_motion * fraction;
-		p_result->remainder = p_motion * (1.0f - fraction);
-		p_result->collision_safe_fraction = fraction;
-		p_result->collision_unsafe_fraction = fraction;
 		return false;
 	}
 
