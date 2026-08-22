@@ -56,6 +56,15 @@ public:
 
 	void set_space(Box3DSpace3D* p_space) override;
 
+	// Box3DObjectImpl3D::set_collision_layer/mask only ever assigned the member -- the
+	// filter is otherwise baked into each b3 shape once, at creation (see
+	// create_box3d_shape()), so changing a body's layer/mask after it was already in the
+	// space never took effect. These push the new filter to every live b3 shape via
+	// b3Shape_SetFilter, far cheaper than a rebuild_shapes() round trip.
+	void set_collision_layer(uint32_t p_layer) override;
+
+	void set_collision_mask(uint32_t p_mask) override;
+
 	// Rebuilds every live b3ShapeId for the current body (used after (re)attaching to a
 	// space, and after body type transitions that need shapes recreated).
 	void rebuild_shapes();
@@ -94,6 +103,11 @@ private:
 	void _create_shape_instance(Box3DShapeInstance3D& p_instance);
 
 	void _destroy_shape_instance(Box3DShapeInstance3D& p_instance);
+
+	// Re-derives the b3 filter from the current collision_layer/collision_mask and pushes
+	// it to every live shape instance. No-op if the body has no b3ShapeIds yet -- the next
+	// _create_shape_instance() picks up the current members on its own.
+	void _update_shape_filters();
 
 	// Recomputes height_field_offset from the current shape set and body scale. Returns true
 	// if it changed, meaning the live shapes and the b3 body transform are both stale.
