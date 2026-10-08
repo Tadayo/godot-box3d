@@ -147,6 +147,12 @@ void Box3DPhysicsServer3D::_shape_set_data(const RID& p_shape, const Variant& p_
 	Box3DShapeImpl3D* shape = shape_owner.get_or_null(p_shape);
 	ERR_FAIL_NULL(shape);
 	shape->set_data(p_data);
+	// Bodies already carrying this shape were built from the old data -- or skipped the
+	// b3 shape entirely when the data arrived after attach (CSGShape3D's use_collision
+	// flow: attach empty concave, fill faces on bake). Without this, those stay dead.
+	for (Box3DShapedObjectImpl3D* owner : shape->get_owners()) {
+		owner->on_shape_data_changed(shape);
+	}
 }
 
 void Box3DPhysicsServer3D::_shape_set_custom_solver_bias(const RID& p_shape, double p_bias) {
